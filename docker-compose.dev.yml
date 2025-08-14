@@ -1,0 +1,293 @@
+# AI综合分析管理平台 - 开发环境Docker编排配置
+version: '3.8'
+
+services:
+  # PostgreSQL数据库 - 开发环境
+  postgres-dev:
+    image: postgres:15-alpine
+    container_name: ai-analysis-postgres-dev
+    environment:
+      POSTGRES_DB: ai_analysis_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./数据库设计.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5433:5432"  # 避免与本地PostgreSQL冲突
+    networks:
+      - ai-analysis-dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_analysis_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Redis缓存和消息队列 - 开发环境
+  redis-dev:
+    image: redis:7-alpine
+    container_name: ai-analysis-redis-dev
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_dev_data:/data
+    ports:
+      - "6380:6379"  # 避免与本地Redis冲突
+    networks:
+      - ai-analysis-dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 后端API服务 - 开发环境（热重载）
+  backend-dev:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai-analysis-backend-dev
+    environment:
+      # 数据库配置
+      DATABASE_URL: postgresql://postgres:dev_password@postgres-dev:5432/ai_analysis_dev
+      
+      # Redis配置
+      REDIS_URL: redis://redis-dev:6379/0
+      
+      # 应用配置
+      SECRET_KEY: dev_secret_key_not_for_production
+      ENCRYPTION_KEY: dev_encryption_key_32_chars_long
+      DEBUG: true
+      LOG_LEVEL: DEBUG
+      
+      # 开发环境特定配置
+      RELOAD: true
+      WORKERS: 1
+      
+      # Webhook配置
+      WEBHOOK_BASE_URL: http://localhost:8000/api/v1/webhooks
+      
+      # 文件处理配置
+      MAX_FILE_SIZE_MB: 50
+      TEMP_DIR: /tmp/ai-analysis-dev
+      
+      # AI模型配置
+      DEFAULT_AI_TIMEOUT: 60
+      MAX_RETRIES: 2
+      
+      # 安全配置（开发环境宽松）
+      CORS_ORIGINS: "*"
+      RATE_LIMIT_PER_MINUTE: 1000
+    volumes:
+      - ./backend:/app:cached  # 代码热重载
+      - ./backend/logs:/app/logs
+      - /tmp/ai-analysis-dev:/tmp/ai-analysis-dev
+    ports:
+      - "8000:8000"
+    networks:
+      - ai-analysis-dev-network
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+      redis-dev:
+        condition: service_healthy
+    restart: unless-stopped
+    command: >
+      sh -c "pip install -r requirements-dev.txt &&
+             alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # Celery Worker - 开发环境
+  celery-worker-dev:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai-analysis-celery-worker-dev
+    command: celery -A app.tasks.celery_app worker --loglevel=debug --concurrency=2
+    environment:
+      DATABASE_URL: postgresql://postgres:dev_password@postgres-dev:5432/ai_analysis_dev
+      REDIS_URL: redis://redis-dev:6379/0
+      SECRET_KEY: dev_secret_key_not_for_production
+      ENCRYPTION_KEY: dev_encryption_key_32_chars_long
+      DEBUG: true
+      LOG_LEVEL: DEBUG
+      MAX_FILE_SIZE_MB: 50
+      DEFAULT_AI_TIMEOUT: 60
+      MAX_RETRIES: 2
+    volumes:
+      - ./backend:/app:cached
+      - ./backend/logs:/app/logs
+      - /tmp/ai-analysis-dev:/tmp/ai-analysis-dev
+    networks:
+      - ai-analysis-dev-network
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+      redis-dev:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Flower - 开发环境任务监控
+  celery-flower-dev:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai-analysis-celery-flower-dev
+    command: celery -A app.tasks.celery_app flower --port=5555
+    environment:
+      REDIS_URL: redis://redis-dev:6379/0
+    ports:
+      - "5555:5555"
+    networks:
+      - ai-analysis-dev-network
+    depends_on:
+      - redis-dev
+    restart: unless-stopped
+
+  # 前端开发服务器（Vite热重载）
+  frontend-dev:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: ai-analysis-frontend-dev
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+      VITE_APP_TITLE: AI综合分析管理平台（开发环境）
+      VITE_DEV_MODE: true
+    volumes:
+      - ./frontend:/app:cached
+      - /app/node_modules  # 避免本地node_modules覆盖容器内的
+    ports:
+      - "3000:3000"
+    networks:
+      - ai-analysis-dev-network
+    depends_on:
+      - backend-dev
+    restart: unless-stopped
+    command: npm run dev -- --host 0.0.0.0
+
+  # PostgreSQL管理界面（可选）
+  pgadmin-dev:
+    image: dpage/pgadmin4:latest
+    container_name: ai-analysis-pgadmin-dev
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@dev.com
+      PGADMIN_DEFAULT_PASSWORD: dev_password
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+      - pgadmin_dev_data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    networks:
+      - ai-analysis-dev-network
+    depends_on:
+      - postgres-dev
+    restart: unless-stopped
+    profiles:
+      - tools
+
+  # Redis管理界面（可选）
+  redis-commander-dev:
+    image: rediscommander/redis-commander:latest
+    container_name: ai-analysis-redis-commander-dev
+    environment:
+      REDIS_HOSTS: local:redis-dev:6379
+    ports:
+      - "8081:8081"
+    networks:
+      - ai-analysis-dev-network
+    depends_on:
+      - redis-dev
+    restart: unless-stopped
+    profiles:
+      - tools
+
+  # MailHog - 邮件测试工具（可选）
+  mailhog-dev:
+    image: mailhog/mailhog:latest
+    container_name: ai-analysis-mailhog-dev
+    ports:
+      - "1025:1025"  # SMTP端口
+      - "8025:8025"  # Web界面端口
+    networks:
+      - ai-analysis-dev-network
+    restart: unless-stopped
+    profiles:
+      - tools
+
+  # 文档服务器（可选）
+  docs-dev:
+    image: nginx:alpine
+    container_name: ai-analysis-docs-dev
+    volumes:
+      - ./docs:/usr/share/nginx/html:ro
+    ports:
+      - "8080:80"
+    networks:
+      - ai-analysis-dev-network
+    restart: unless-stopped
+    profiles:
+      - tools
+
+networks:
+  ai-analysis-dev-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+volumes:
+  postgres_dev_data:
+    driver: local
+  redis_dev_data:
+    driver: local
+  pgadmin_dev_data:
+    driver: local
+
+# 开发环境使用说明:
+# 
+# 1. 启动基础开发环境:
+#    docker-compose -f docker-compose.dev.yml up -d
+# 
+# 2. 启动包含管理工具:
+#    docker-compose -f docker-compose.dev.yml --profile tools up -d
+# 
+# 3. 查看服务状态:
+#    docker-compose -f docker-compose.dev.yml ps
+# 
+# 4. 查看日志:
+#    docker-compose -f docker-compose.dev.yml logs -f [service_name]
+# 
+# 5. 进入容器调试:
+#    docker-compose -f docker-compose.dev.yml exec backend-dev bash
+# 
+# 6. 重启特定服务:
+#    docker-compose -f docker-compose.dev.yml restart backend-dev
+# 
+# 7. 停止所有服务:
+#    docker-compose -f docker-compose.dev.yml down
+# 
+# 8. 完全清理（包括数据）:
+#    docker-compose -f docker-compose.dev.yml down -v --remove-orphans
+# 
+# 服务访问地址:
+# - 后端API: http://localhost:8000
+# - 前端应用: http://localhost:3000
+# - API文档: http://localhost:8000/docs
+# - Celery监控: http://localhost:5555
+# - PostgreSQL: localhost:5433
+# - Redis: localhost:6380
+# - PgAdmin: http://localhost:5050 (需要--profile tools)
+# - Redis Commander: http://localhost:8081 (需要--profile tools)
+# - MailHog: http://localhost:8025 (需要--profile tools)
+# - 文档: http://localhost:8080 (需要--profile tools)
+# 
+# 开发环境特性:
+# - 代码热重载
+# - 详细的调试日志
+# - 宽松的CORS策略
+# - 较小的文件大小限制
+# - 快速的健康检查
+# - 开发工具集成
